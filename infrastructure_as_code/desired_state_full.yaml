@@ -1,0 +1,55 @@
+# desired_state.yaml
+# Define your VxLAN EVPN infrastructure declaratively
+
+# Fabric context
+fabric: DevNet_VxLAN_Fabric
+
+# VRFs (L3 VNIs)
+vrfs:
+  - name: PRODUCTION
+    fabric: DevNet_VxLAN_Fabric
+    vni: 50001
+    vlan_id: 2001
+  
+  - name: DEV
+    fabric: DevNet_VxLAN_Fabric
+    vni: 50002
+    vlan_id: 2002
+
+# Networks (L2 VNIs + SVIs)
+networks:
+  - name: Web_Servers
+    fabric: DevNet_VxLAN_Fabric
+    vrf: PRODUCTION
+    vlan_id: 100
+    vni: 30100
+    gateway: 192.168.100.1/24
+    mtu: 9216
+    suppress_arp: true
+  
+  - name: Database_Servers
+    fabric: DevNet_VxLAN_Fabric
+    vrf: PRODUCTION
+    vlan_id: 200
+    vni: 30200
+    gateway: 192.168.200.1/24
+    mtu: 9216
+    suppress_arp: true
+  
+  - name: App_Servers
+    fabric: DevNet_VxLAN_Fabric
+    vrf: PRODUCTION
+    vlan_id: 30
+    vni: 30300
+    gateway: 10.30.0.1/24
+    mtu: 9216
+    suppress_arp: true
+
+  - name: Dev_Network
+    fabric: DevNet_VxLAN_Fabric
+    vrf: DEV
+    vlan_id: 40
+    vni: 30400
+    gateway: 10.40.0.1/24
+    mtu: 9216
+    suppress_arp: true

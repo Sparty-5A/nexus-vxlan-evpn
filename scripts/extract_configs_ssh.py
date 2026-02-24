@@ -91,7 +91,7 @@ def main():
         switches = FALLBACK_DEVICES
 
     # Create output directory
-    output_dir = Path('configs_new')
+    output_dir = Path('configs')
     output_dir.mkdir(exist_ok=True)
     print(f"✓ Created output directory: {output_dir}")
 

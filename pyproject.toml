@@ -1,0 +1,40 @@
+[project]
+name = "nexus-vxlan-evpn"
+version = "1.0.0"
+description = "VxLAN EVPN automation and learning scripts for Cisco Nexus 9000"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.7.0",  # Better terminal output
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8.0",
+    "black>=24.0.0",
+    "pytest>=8.0.0",
+]
+
+[tool.ruff]
+line-length = 127
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # Line too long (black handles this)
+    "E722",  # Bare except (acceptable in network scripts)
+    "F841",  # Unused variable
+]
+
+[tool.black]
+line-length = 127
+target-version = ["py313"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests requiring DevNet sandbox",
+    "unit: marks unit tests that can run offline",
+]
+testpaths = ["tests"]

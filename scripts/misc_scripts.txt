@@ -1,0 +1,98 @@
+python3 << 'EOF'
+import httpx
+import json
+
+client = httpx.Client(verify=False, timeout=60)
+
+# Login
+print("Logging in...")
+response = client.post(
+    'https://10.10.20.60/login',
+    json={'userName': 'admin', 'userPasswd': '1vtG@lw@y', 'domain': 'local'}
+)
+
+if response.status_code != 200:
+    print(f"Login failed: {response.status_code}")
+    print(response.text)
+    exit(1)
+
+token = response.json().get('token')
+print(f"✓ Got token: {token[:20]}...")
+
+# Try to get version
+print("\nGetting NDFC info...")
+try:
+    response = client.get(
+        'https://10.10.20.60/appcenter/cisco/ndfc/api/v1/fm/about/version',
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+    )
+    print(f"Status: {response.status_code}")
+    if response.status_code == 200:
+        print("NDFC Version:")
+        print(json.dumps(response.json(), indent=2))
+    else:
+        print(f"Response: {response.text[:500]}")
+except Exception as e:
+    print(f"Error: {e}")
+
+# Also try to list services
+print("\nTrying to list installed services...")
+try:
+    response = client.get(
+        'https://10.10.20.60/platform/config/services',
+        headers={'Authorization': f'Bearer {token}'}
+    )
+    if response.status_code == 200:
+        services = response.json()
+        print("Installed Services:")
+        for service in services:
+            name = service.get('serviceName', 'Unknown')
+            version = service.get('version', 'Unknown')
+            print(f"  - {name}: {version}")
+    else:
+        print(f"Status: {response.status_code}")
+except Exception as e:
+    print(f"Error: {e}")
+EOF
+
+
+python3 << 'EOF'
+import httpx
+
+client = httpx.Client(verify=False, timeout=60)
+
+# Login
+response = client.post(
+    'https://10.10.20.60/login',
+    json={'userName': 'admin', 'userPasswd': '1vtG@lw@y', 'domain': 'local'}
+)
+token = response.json().get('token')
+headers = {'Authorization': f'Bearer {token}'}
+
+# Delete VRF PRODUCTION
+print("Deleting VRF PRODUCTION...")
+try:
+    response = client.delete(
+        'https://10.10.20.60/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down/fabrics/DevNet_VxLAN_Fabric/vrfs/PRODUCTION',
+        headers=headers
+    )
+    print(f"  Status: {response.status_code}")
+except Exception as e:
+    print(f"  Error: {e}")
+
+# Delete VRF DEV
+print("Deleting VRF DEV...")
+try:
+    response = client.delete(
+        'https://10.10.20.60/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down/fabrics/DevNet_VxLAN_Fabric/vrfs/DEV',
+        headers=headers
+    )
+    print(f"  Status: {response.status_code}")
+except Exception as e:
+    print(f"  Error: {e}")
+
+print("Done!")
+EOF

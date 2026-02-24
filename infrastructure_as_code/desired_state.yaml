@@ -1,0 +1,18 @@
+# desired_state_vrfs_only.yaml
+# Just VRFs - we'll create Networks via GUI
+
+fabric: DevNet_VxLAN_Fabric
+
+vrfs:
+  - name: PRODUCTION
+    fabric: DevNet_VxLAN_Fabric
+    vni: 50001
+    vlan_id: 2001
+
+  - name: DEV
+    fabric: DevNet_VxLAN_Fabric
+    vni: 50002
+    vlan_id: 2002
+
+# No networks - will create via GUI
+networks: []

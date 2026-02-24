@@ -1,0 +1,48 @@
+# Environment
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# UV
+.python-version
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs
+outputs/
+*.json
+*.log
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+*.pdf
+*.md
+
+__init__.py
+*/__init__.py
+
+*.docx
