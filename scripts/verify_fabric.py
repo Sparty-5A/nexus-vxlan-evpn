@@ -17,15 +17,15 @@ API Flow:
 
 import os
 import sys
-import httpx
 from typing import Any
+
+import httpx
 from dotenv import load_dotenv
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
 from rich import box
 from rich.columns import Columns
-from rich.text import Text
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 load_dotenv()
 
@@ -301,8 +301,8 @@ def display_topology(links: list[dict]):
     console.print("\n[bold cyan]═══ UNDERLAY TOPOLOGY & LINK STATE ═══[/bold cyan]")
 
     # Separate intra-fabric links from external neighbor links
-    fabric_links = [l for l in links if l.get("link-type") == "ethisl"]
-    external_links = [l for l in links if l.get("link-type") == "lan_neighbor_link"]
+    fabric_links = [link for link in links if link.get("link-type") == "ethisl"]
+    external_links = [link for link in links if link.get("link-type") == "lan_neighbor_link"]
 
     # ── Intra-Fabric Links ──
     table = Table(
@@ -384,9 +384,9 @@ def display_topology(links: list[dict]):
         console.print(ext_table)
 
     # Link summary
-    fabric_up = sum(1 for l in fabric_links if l.get("is-present") and l.get("sw1-info", {}).get("if-op-status") == "Up")
+    fabric_up = sum(1 for link in fabric_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up")
     fabric_down = len(fabric_links) - fabric_up
-    ext_up = sum(1 for l in external_links if l.get("is-present") and l.get("sw1-info", {}).get("if-op-status") == "Up")
+    ext_up = sum(1 for link in external_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up")
 
     console.print(
         f"\n  Fabric links: [green]{fabric_up} up[/green]  [red]{fabric_down} down[/red]  |  "
@@ -399,10 +399,7 @@ def display_vtep_info(nd: NexusDashboard, inventory: list[dict]):
     console.print("\n[bold cyan]═══ VTEP (NVE) INTERFACE STATUS ═══[/bold cyan]")
 
     # Only check switches that are VTEPs (leafs and border leafs, not spines)
-    vtep_switches = [
-        sw for sw in inventory
-        if "spine" not in sw.get("switchRole", "") and sw.get("status") == "ok"
-    ]
+    vtep_switches = [sw for sw in inventory if "spine" not in sw.get("switchRole", "") and sw.get("status") == "ok"]
 
     if not vtep_switches:
         console.print("[yellow]⚠ No reachable VTEP switches found[/yellow]")
@@ -443,8 +440,7 @@ def display_vtep_info(nd: NexusDashboard, inventory: list[dict]):
 
     console.print(table)
     console.print(
-        "\n  [dim]Loopback0 = BGP Router ID (underlay) | "
-        "Loopback1 = VTEP source IP (VxLAN encapsulation endpoint)[/dim]"
+        "\n  [dim]Loopback0 = BGP Router ID (underlay) | " "Loopback1 = VTEP source IP (VxLAN encapsulation endpoint)[/dim]"
     )
 
 
@@ -511,18 +507,14 @@ def display_health_summary(inventory: list[dict], links: list[dict], fabric: dic
 
     # Check 2: All switches reachable
     reachable = [sw for sw in inventory if sw.get("status") == "ok"]
-    checks.append((
-        "Switch Reachability",
-        len(reachable) == len(inventory),
-        f"{len(reachable)}/{len(inventory)} reachable"
-    ))
+    checks.append(("Switch Reachability", len(reachable) == len(inventory), f"{len(reachable)}/{len(inventory)} reachable"))
 
     # Check 3: Fabric links up
-    fabric_links = [l for l in links if l.get("link-type") == "ethisl"]
+    fabric_links = [link for link in links if link.get("link-type") == "ethisl"]
     expected_links = fabric_links  # All configured links
-    up_links = [l for l in fabric_links if l.get("is-present") and l.get("sw1-info", {}).get("if-op-status") == "Up"]
+    up_links = [link for link in fabric_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up"]
     # We expect the non-VPC peer links to be up (exclude admin-down VPC links)
-    active_links = [l for l in fabric_links if l.get("nvPairs")]  # Links with config = intended to be up
+    active_links = [link for link in fabric_links if link.get("nvPairs")]  # Links with config = intended to be up
     checks.append(("Underlay Links", len(up_links) == len(active_links), f"{len(up_links)}/{len(active_links)} up"))
 
     # Check 4: EVPN enabled
@@ -530,8 +522,8 @@ def display_health_summary(inventory: list[dict], links: list[dict], fabric: dic
     checks.append(("EVPN Enabled", evpn_enabled, "Enabled" if evpn_enabled else "Disabled"))
 
     # Check 5: External connectivity
-    ext_links = [l for l in links if l.get("link-type") == "lan_neighbor_link"]
-    ext_up = [l for l in ext_links if l.get("is-present") and l.get("sw1-info", {}).get("if-op-status") == "Up"]
+    ext_links = [link for link in links if link.get("link-type") == "lan_neighbor_link"]
+    ext_up = [link for link in ext_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up"]
     checks.append(("External/DCI Links", len(ext_up) > 0, f"{len(ext_up)}/{len(ext_links)} up"))
 
     # Display checks
@@ -553,15 +545,9 @@ def display_health_summary(inventory: list[dict], links: list[dict], fabric: dic
 
     # Overall verdict
     if all_pass:
-        console.print(Panel(
-            "[bold green]✓ ALL CHECKS PASSED - FABRIC HEALTHY[/bold green]",
-            border_style="green"
-        ))
+        console.print(Panel("[bold green]✓ ALL CHECKS PASSED - FABRIC HEALTHY[/bold green]", border_style="green"))
     else:
-        console.print(Panel(
-            "[bold yellow]⚠ SOME CHECKS FAILED - REVIEW ABOVE[/bold yellow]",
-            border_style="yellow"
-        ))
+        console.print(Panel("[bold yellow]⚠ SOME CHECKS FAILED - REVIEW ABOVE[/bold yellow]", border_style="yellow"))
 
 
 # ─────────────────────────────────────────────

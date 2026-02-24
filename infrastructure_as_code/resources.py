@@ -1,23 +1,25 @@
 """
 Resource type definitions for Nexus Dashboard infrastructure
 """
-from dataclasses import dataclass, asdict, field
-from typing import Dict, Any, List
+
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List
 
 
 @dataclass
 class Resource:
     """Base resource class"""
+
     name: str
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
         return asdict(self)
-    
+
     def resource_id(self) -> str:
         """Unique identifier for this resource"""
         return f"{self.__class__.__name__}:{self.name}"
-    
+
     def create_payload(self) -> Dict[str, Any]:
         """Convert to NDFC API payload - must be implemented by subclass"""
         raise NotImplementedError(f"{self.__class__.__name__} must implement create_payload()")
@@ -26,10 +28,11 @@ class Resource:
 @dataclass
 class FabricInfo(Resource):
     """Fabric metadata (read-only for now)"""
+
     name: str
     asn: int = 65001
     fabric_type: str = "Switch_Fabric"
-    
+
     def create_payload(self) -> Dict[str, Any]:
         # Fabric creation is complex and typically done via GUI
         # For this framework, we assume fabric already exists
@@ -39,11 +42,12 @@ class FabricInfo(Resource):
 @dataclass
 class VRF(Resource):
     """VRF resource"""
+
     name: str
     fabric: str
     vni: int
     vlan_id: int = 999
-    
+
     def create_payload(self) -> Dict[str, Any]:
         # vrfTemplateConfig must be a JSON string, not object!
         vrf_template_config = {
@@ -82,23 +86,25 @@ class VRF(Resource):
             "vrfVlanId": self.vlan_id,
             "vrfSegmentId": self.vni,
             "nveId": "1",
-            "asn": ""
+            "asn": "",
         }
 
         import json
+
         return {
             "fabric": self.fabric,
             "vrfName": self.name,
             "vrfId": self.vni,
             "vrfTemplate": "Default_VRF_Universal",
             "vrfExtensionTemplate": "Default_VRF_Extension_Universal",
-            "vrfTemplateConfig": json.dumps(vrf_template_config)  # Must be string!
+            "vrfTemplateConfig": json.dumps(vrf_template_config),  # Must be string!
         }
 
 
 @dataclass
 class Network(Resource):
     """Network resource (VLAN + VNI + SVI)"""
+
     name: str
     fabric: str
     vrf: str
@@ -145,17 +151,18 @@ class Network(Resource):
             "vrfName": self.vrf,
             "networkName": self.name,
             "nveId": "1",
-            "isLayer2Only": False
+            "isLayer2Only": False,
         }
 
         import json
+
         return {
             "fabric": self.fabric,
             "networkName": self.name,
             "networkId": self.vni,
             "vrf": self.vrf,
             "networkTemplate": "Default_Network_Universal",
-            "networkTemplateConfig": json.dumps(network_template_config)  # Must be string!
+            "networkTemplateConfig": json.dumps(network_template_config),  # Must be string!
         }
 
     def dependencies(self) -> List[str]:
