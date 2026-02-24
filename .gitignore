@@ -39,10 +39,6 @@ outputs/
 .coverage
 htmlcov/
 
-*.pdf
-*.md
-
 __init__.py
 */__init__.py
 
-*.docx
