@@ -384,9 +384,13 @@ def display_topology(links: list[dict]):
         console.print(ext_table)
 
     # Link summary
-    fabric_up = sum(1 for link in fabric_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up")
+    fabric_up = sum(
+        1 for link in fabric_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up"
+    )
     fabric_down = len(fabric_links) - fabric_up
-    ext_up = sum(1 for link in external_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up")
+    ext_up = sum(
+        1 for link in external_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up"
+    )
 
     console.print(
         f"\n  Fabric links: [green]{fabric_up} up[/green]  [red]{fabric_down} down[/red]  |  "
@@ -512,7 +516,9 @@ def display_health_summary(inventory: list[dict], links: list[dict], fabric: dic
     # Check 3: Fabric links up
     fabric_links = [link for link in links if link.get("link-type") == "ethisl"]
     expected_links = fabric_links  # All configured links
-    up_links = [link for link in fabric_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up"]
+    up_links = [
+        link for link in fabric_links if link.get("is-present") and link.get("sw1-info", {}).get("if-op-status") == "Up"
+    ]
     # We expect the non-VPC peer links to be up (exclude admin-down VPC links)
     active_links = [link for link in fabric_links if link.get("nvPairs")]  # Links with config = intended to be up
     checks.append(("Underlay Links", len(up_links) == len(active_links), f"{len(up_links)}/{len(active_links)} up"))

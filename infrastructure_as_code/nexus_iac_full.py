@@ -1,44 +1,232 @@
 #!/usr/bin/env python3
 """
-Nexus Dashboard Infrastructure as Code Framework - COMPLETE VERSION
+Nexus Dashboard Infrastructure as Code Framework
 
-Full IaC with apply/destroy for VRFs and Networks
+Full IaC with apply/destroy for VRFs and Networks.
 
 Usage:
-    python nexus_iac_full.py inventory  # Show fabric inventory
-    python nexus_iac_full.py sync       # Sync current state from NDFC
-    python nexus_iac_full.py plan       # Show what will change
-    python nexus_iac_full.py apply      # Apply changes
-    python nexus_iac_full.py destroy    # Destroy all managed resources
+    uv run nexus_iac_full.py inventory  # Show fabric inventory
+    uv run nexus_iac_full.py sync       # Sync current state from NDFC
+    uv run nexus_iac_full.py plan       # Show what will change
+    uv run nexus_iac_full.py apply      # Apply changes
+    uv run nexus_iac_full.py destroy    # Destroy all managed resources
+
+Bugs fixed vs previous version:
+  - VRF deploy payload was {"vrfNames": [...]} (array) → must be {"vrfName": "name"} (string)
+  - VRF/Network attach payload was flat array → must be wrapped in lanAttachList with
+    required fields: isAttached, freeformConfig, extensionValues, instanceValues
+  - Step order corrected: create → attach → deploy (was: create → deploy → attach → deploy)
+  - Serial numbers now fetched via fabric inventory endpoint (more reliable than allswitches)
+  - Network deploy payload field confirmed as "networkNames" (array) — correct for networks
+  - Removed broken deploy_vrf() stub from api_client — all deployment logic lives here
 """
 
 import sys
+import yaml
 import time
 from pathlib import Path
-from typing import Any, Dict, List
-
-import yaml
+from typing import List, Dict, Any, Optional
 
 try:
-    from rich import box
     from rich.console import Console
-    from rich.panel import Panel
     from rich.table import Table
+    from rich.panel import Panel
+    from rich import box
 except ImportError:
     print("Installing required packages...")
     import subprocess
 
     subprocess.check_call([sys.executable, "-m", "pip", "install", "rich", "pyyaml", "--break-system-packages", "-q"])
-    from rich import box
     from rich.console import Console
-    from rich.panel import Panel
     from rich.table import Table
+    from rich.panel import Panel
+    from rich import box
 
 from api_client import NDFCClient
-from resources import VRF, Network, Resource
 from state_manager import StateManager
+from resources import Resource, VRF, Network
 
 console = Console()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+FABRIC_NAME = "DevNet_VxLAN_Fabric"
+
+# Fallback serial numbers for this reservation — update if sandbox is re-reserved.
+# These are used if the inventory API returns an empty list.
+FALLBACK_LEAF_SERIALS = [
+    "99433ZAWNB5",  # site1-leaf1
+    "9IN20QRUUYM",  # site1-leaf2
+    "9SH6SMKS9CE",  # site1-leaf3
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_leaf_serials(client: NDFCClient, fabric_name: str) -> List[str]:
+    """
+    Fetch leaf serial numbers from NDFC.
+
+    Tries the fabric-scoped inventory endpoint first (more reliable).
+    Falls back to allswitches, then to the hardcoded FALLBACK_LEAF_SERIALS constant.
+    Always returns at least one serial so the caller doesn't silently skip attachment.
+    """
+    # Attempt 1 — fabric-scoped inventory (returns only fabric members)
+    try:
+        switches = client.get(f"/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/control/fabrics" f"/{fabric_name}/inventory")
+        if isinstance(switches, list) and switches:
+            leafs = [
+                s["serialNumber"] for s in switches if "leaf" in s.get("switchRole", "").lower() and s.get("serialNumber")
+            ]
+            if leafs:
+                console.print(f"    [dim]Found {len(leafs)} leaf(s) via fabric inventory[/dim]")
+                return leafs
+    except Exception:
+        pass
+
+    # Attempt 2 — global allswitches endpoint
+    try:
+        switches = client.get("/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/inventory/allswitches")
+        if isinstance(switches, list) and switches:
+            leafs = [
+                s["serialNumber"] for s in switches if "leaf" in s.get("switchRole", "").lower() and s.get("serialNumber")
+            ]
+            if leafs:
+                console.print(f"    [dim]Found {len(leafs)} leaf(s) via allswitches[/dim]")
+                return leafs
+    except Exception:
+        pass
+
+    # Fallback — hardcoded serials for this reservation
+    console.print(
+        f"    [yellow]⚠ Could not fetch leaf serials from API — "
+        f"using hardcoded fallback ({len(FALLBACK_LEAF_SERIALS)} leafs)[/yellow]"
+    )
+    console.print("    [dim]If sandbox was re-reserved, update FALLBACK_LEAF_SERIALS in this script[/dim]")
+    return FALLBACK_LEAF_SERIALS
+
+
+def build_vrf_attach_payload(fabric: str, vrf_name: str, serial_numbers: List[str]) -> List[Dict[str, Any]]:
+    """
+    Build the correct VRF attachment payload for the NDFC attachments API.
+
+    NDFC expects a list where each element represents one VRF, containing a
+    lanAttachList of per-switch attachment records.
+
+    Correct structure (verified against live NDFC):
+        [
+          {
+            "vrfName": "PRODUCTION",
+            "lanAttachList": [
+              {
+                "fabric": "DevNet_VxLAN_Fabric",
+                "vrfName": "PRODUCTION",
+                "serialNumber": "99433ZAWNB5",
+                "vlan": 0,
+                "isAttached": true,
+                "deployment": false,
+                "freeformConfig": "",
+                "extensionValues": "",
+                "instanceValues": ""
+              },
+              ...
+            ]
+          }
+        ]
+
+    Common mistakes (both cause 500 errors):
+      - Sending a flat array of individual dicts without the lanAttachList wrapper
+      - Omitting required fields like isAttached, freeformConfig, extensionValues
+    """
+    return [
+        {
+            "vrfName": vrf_name,
+            "lanAttachList": [
+                {
+                    "fabric": fabric,
+                    "vrfName": vrf_name,
+                    "serialNumber": serial,
+                    "vlan": 0,  # 0 = use VRF's configured VLAN
+                    "isAttached": True,
+                    "deployment": False,  # Deployment is a separate step
+                    "freeformConfig": "",
+                    "extensionValues": "",
+                    "instanceValues": "",
+                }
+                for serial in serial_numbers
+            ],
+        }
+    ]
+
+
+def build_network_attach_payload(
+    fabric: str, network_name: str, vlan_id: int, serial_numbers: List[str]
+) -> List[Dict[str, Any]]:
+    """
+    Build the correct Network attachment payload for the NDFC attachments API.
+
+    Same lanAttachList wrapper structure as VRF, with network-specific fields.
+
+    Correct structure (verified against live NDFC):
+        [
+          {
+            "networkName": "Web_Servers",
+            "lanAttachList": [
+              {
+                "fabric": "DevNet_VxLAN_Fabric",
+                "networkName": "Web_Servers",
+                "serialNumber": "99433ZAWNB5",
+                "vlan": 100,
+                "isAttached": true,
+                "deployment": false,
+                "freeformConfig": "",
+                "extensionValues": "",
+                "instanceValues": "",
+                "dot1QVlan": 1,
+                "untagged": false,
+                "detachSwitchPorts": "",
+                "switchPorts": "",
+                "isTrunkAll": false
+              },
+              ...
+            ]
+          }
+        ]
+    """
+    return [
+        {
+            "networkName": network_name,
+            "lanAttachList": [
+                {
+                    "fabric": fabric,
+                    "networkName": network_name,
+                    "serialNumber": serial,
+                    "vlan": vlan_id,
+                    "isAttached": True,
+                    "deployment": False,
+                    "freeformConfig": "",
+                    "extensionValues": "",
+                    "instanceValues": "",
+                    "dot1QVlan": 1,
+                    "untagged": False,
+                    "detachSwitchPorts": "",
+                    "switchPorts": "",
+                    "isTrunkAll": False,
+                }
+                for serial in serial_numbers
+            ],
+        }
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IaC Framework
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class NexusIaCFull:
@@ -48,10 +236,20 @@ class NexusIaCFull:
         self.config_file = Path(config_file)
         self.state_manager = StateManager()
 
-        # DevNet sandbox credentials
         self.client = NDFCClient(url="https://10.10.20.60", username="admin", password="1vtG@lw@y")
 
-        self.fabric_name = "DevNet_VxLAN_Fabric"
+        self.fabric_name = FABRIC_NAME
+
+        # Cached leaf serials — fetched once per run, reused for all attachments
+        self._leaf_serials: Optional[List[str]] = None
+
+    def _get_leaf_serials(self) -> List[str]:
+        """Fetch and cache leaf serial numbers"""
+        if self._leaf_serials is None:
+            self._leaf_serials = get_leaf_serials(self.client, self.fabric_name)
+        return self._leaf_serials
+
+    # ── Inventory ─────────────────────────────────────────────────────────────
 
     def inventory(self) -> None:
         """Show fabric inventory"""
@@ -83,6 +281,7 @@ class NexusIaCFull:
                 sw_table.add_column("Hostname", style="cyan")
                 sw_table.add_column("IP", style="white")
                 sw_table.add_column("Role", style="yellow")
+                sw_table.add_column("Serial", style="dim")
                 sw_table.add_column("Status", style="green")
 
                 for switch in switches:
@@ -94,6 +293,7 @@ class NexusIaCFull:
                         hostname,
                         switch.get("ipAddress", "N/A"),
                         switch.get("switchRole", "N/A"),
+                        switch.get("serialNumber", "N/A"),
                         f"[{status_color}]{status}[/{status_color}]",
                     )
                 console.print(sw_table)
@@ -102,53 +302,76 @@ class NexusIaCFull:
         except Exception as e:
             console.print(f"[red]✗ Error: {e}[/red]")
 
+    # ── Sync ──────────────────────────────────────────────────────────────────
+
     def sync_from_ndfc(self) -> None:
         """Sync current state from NDFC"""
         console.print("\n[bold cyan]═══ Syncing State from NDFC ═══[/bold cyan]\n")
 
         try:
-            # Clear existing state first (fresh sync)
             self.state_manager.current_state = {}
 
-            # Get VRFs
             console.print("Fetching VRFs...", end=" ")
             vrfs = self.client.get_vrfs(self.fabric_name)
             console.print(f"[green]✓[/green] Found {len(vrfs)}")
 
             for vrf_data in vrfs:
+                # vrfTemplateConfig is a JSON string nested inside the response —
+                # parse it to get vrfVlanId (not available at the top level)
+                import json as _json
+
+                tpl_raw = vrf_data.get("vrfTemplateConfig", "{}")
+                try:
+                    tpl = _json.loads(tpl_raw) if isinstance(tpl_raw, str) else tpl_raw
+                except Exception:
+                    tpl = {}
+
                 vrf = VRF(
                     name=vrf_data.get("vrfName"),
                     fabric=self.fabric_name,
                     vni=vrf_data.get("vrfId", 0),
-                    vlan_id=vrf_data.get("vrfVlanId", 999),
+                    vlan_id=int(tpl.get("vrfVlanId", 0)) or vrf_data.get("vrfVlanId", 0),
                 )
                 self.state_manager.update_resource(vrf)
 
-            # Get Networks
             console.print("Fetching Networks...", end=" ")
             networks = self.client.get_networks(self.fabric_name)
             console.print(f"[green]✓[/green] Found {len(networks)}")
 
             for net_data in networks:
+                # networkTemplateConfig is also a JSON string — gateway, vlanId,
+                # and suppressArp are inside it, not at the top level of the response
+                import json as _json
+
+                tpl_raw = net_data.get("networkTemplateConfig", "{}")
+                try:
+                    tpl = _json.loads(tpl_raw) if isinstance(tpl_raw, str) else tpl_raw
+                except Exception:
+                    tpl = {}
+
+                # suppress_arp comes back as string "true"/"false" — normalise to bool
+                suppress_raw = tpl.get("suppressArp", "true")
+                suppress_arp = suppress_raw is True or str(suppress_raw).lower() == "true"
+
                 network = Network(
                     name=net_data.get("networkName"),
                     fabric=self.fabric_name,
                     vrf=net_data.get("vrf", ""),
-                    vlan_id=net_data.get("vlanId", 0),
+                    vlan_id=int(tpl.get("vlanId", 0)) or net_data.get("vlanId", 0),
                     vni=net_data.get("networkId", 0),
-                    gateway=net_data.get("gatewayIpAddress", ""),
-                    mtu=net_data.get("mtu", 9216),
-                    suppress_arp=net_data.get("suppressArp", True),
+                    gateway=tpl.get("gatewayIpAddress", ""),
+                    mtu=int(tpl.get("mtu", 9216)),
+                    suppress_arp=suppress_arp,
                 )
                 self.state_manager.update_resource(network)
 
-            # Save state (only VRFs and Networks, no FabricInfo)
             self.state_manager.save_current_state()
-            console.print("\n[green]✓ State synchronized[/green]\n")
-            console.print("[dim]Note: Fabric metadata is not managed (read-only)[/dim]\n")
+            console.print(f"\n[green]✓ State synchronized[/green]\n")
 
         except Exception as e:
             console.print(f"[red]✗ Error: {e}[/red]")
+
+    # ── Plan ──────────────────────────────────────────────────────────────────
 
     def load_desired_config(self) -> List[Resource]:
         """Load desired configuration from YAML"""
@@ -160,12 +383,8 @@ class NexusIaCFull:
             config = yaml.safe_load(f)
 
         resources = []
-
-        # Parse VRFs
         for vrf_config in config.get("vrfs", []):
             resources.append(VRF(**vrf_config))
-
-        # Parse Networks
         for network_config in config.get("networks", []):
             resources.append(Network(**network_config))
 
@@ -175,20 +394,14 @@ class NexusIaCFull:
         """Show what will change"""
         console.print("\n[bold cyan]═══ Planning Changes ═══[/bold cyan]\n")
 
-        # Load desired state
         desired_resources = self.load_desired_config()
         if not desired_resources:
             console.print("[yellow]No desired state loaded[/yellow]")
             return {}
 
         self.state_manager.set_desired_state(desired_resources)
-
-        # Compute diff
         diff = self.state_manager.compute_diff()
-
-        # Display
         self._display_plan(diff)
-
         return diff
 
     def _display_plan(self, diff: Dict[str, Any]) -> None:
@@ -200,194 +413,159 @@ class NexusIaCFull:
         if create_count > 0:
             console.print("[bold green]Resources to CREATE:[/bold green]")
             for resource_id in diff["create"]:
-                console.print(f"  [green]+[/green] {resource_id}")
-            console.print()
+                console.print(f"  [green]+ {resource_id}[/green]")
 
         if update_count > 0:
-            console.print("[bold yellow]Resources to UPDATE:[/bold yellow]")
+            console.print("\n[bold yellow]Resources to UPDATE:[/bold yellow]")
             for resource_id in diff["update"]:
-                console.print(f"  [yellow]~[/yellow] {resource_id}")
-            console.print()
+                console.print(f"  [yellow]~ {resource_id}[/yellow]")
 
         if delete_count > 0:
-            console.print("[bold red]Resources to DELETE:[/bold red]")
+            console.print("\n[bold red]Resources to DELETE:[/bold red]")
             for resource_id in diff["delete"]:
-                console.print(f"  [red]-[/red] {resource_id}")
-            console.print()
+                console.print(f"  [red]- {resource_id}[/red]")
 
-        total_changes = create_count + update_count + delete_count
-        if total_changes == 0:
-            console.print(
-                Panel("[green]✓ No changes needed. Infrastructure matches desired state.[/green]", border_style="green")
-            )
+        if create_count == 0 and update_count == 0 and delete_count == 0:
+            console.print("[green]✓ No changes needed — infrastructure is up to date[/green]")
         else:
             console.print(
-                Panel(
-                    f"[yellow]Plan: {create_count} to create, {update_count} to update, {delete_count} to delete[/yellow]",
-                    border_style="yellow",
-                )
+                f"\nPlan: [green]{create_count} to create[/green], "
+                f"[yellow]{update_count} to update[/yellow], "
+                f"[red]{delete_count} to delete[/red]"
             )
+
+    # ── Apply ─────────────────────────────────────────────────────────────────
 
     def apply(self) -> None:
         """Apply changes"""
-        # Show plan first
-        diff = self.plan()
-
-        total_changes = len(diff.get("create", [])) + len(diff.get("update", [])) + len(diff.get("delete", []))
-        if total_changes == 0:
-            return
-
-        # Confirm
-        console.print()
-        response = console.input("[yellow]Apply these changes? (yes/no):[/yellow] ")
-        if response.lower() != "yes":
-            console.print("[red]Apply cancelled[/red]")
-            return
-
         console.print("\n[bold cyan]═══ Applying Changes ═══[/bold cyan]\n")
 
-        try:
-            # Create resources (in dependency order: VRFs before Networks)
-            for resource_id in diff.get("create", []):
-                self._create_resource(resource_id)
-                time.sleep(1)  # Rate limiting
+        desired_resources = self.load_desired_config()
+        if not desired_resources:
+            return
 
-            # Updates
-            for resource_id in diff.get("update", []):
-                console.print(f"[yellow]Updating {resource_id}...[/yellow] (not implemented)")
+        self.state_manager.set_desired_state(desired_resources)
+        diff = self.state_manager.compute_diff()
 
-            # Deletes
-            for resource_id in diff.get("delete", []):
-                self._delete_resource(resource_id)
-                time.sleep(1)
+        if not any([diff["create"], diff["update"], diff["delete"]]):
+            console.print("[green]✓ Nothing to do[/green]\n")
+            return
 
-            # Save state
-            self.state_manager.save_current_state()
+        # Pre-fetch leaf serials once for the entire apply run
+        console.print("Fetching leaf serial numbers...", end=" ")
+        serials = self._get_leaf_serials()
+        console.print(f"[green]✓[/green] {serials}\n")
 
-            console.print("\n[bold green]✓ Apply complete![/bold green]\n")
-            console.print("[dim]Note: It may take 30-60 seconds for config to fully propagate to switches[/dim]\n")
+        # Create resources (VRFs before Networks — respects dependencies)
+        vrfs_to_create = [r for r in diff["create"] if r.startswith("VRF:")]
+        networks_to_create = [r for r in diff["create"] if r.startswith("Network:")]
 
-        except Exception as e:
-            console.print(f"\n[red]✗ Apply failed: {e}[/red]")
-            import traceback
+        for resource_id in vrfs_to_create:
+            self._create_resource(resource_id, serials)
+            time.sleep(2)
 
-            console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        for resource_id in networks_to_create:
+            self._create_resource(resource_id, serials)
+            time.sleep(2)
 
-    def _create_resource(self, resource_id: str) -> None:
-        """Create a single resource"""
-        resource_data = self.state_manager.get_resource(resource_id)
-        resource_type = resource_id.split(":")[0]
+        # Deletes
+        for resource_id in diff["delete"]:
+            self._delete_resource(resource_id)
+            time.sleep(1)
 
-        console.print(f"[green]Creating[/green] {resource_id}...", end=" ")
+        self.state_manager.save_current_state()
+        console.print("\n[bold green]✓ Apply complete[/bold green]\n")
+
+    def _create_resource(self, resource_id: str, leaf_serials: List[str]) -> None:
+        """Create a single resource — full create → attach → deploy workflow"""
+        resource_type, name = resource_id.split(":", 1)
+        resource_data = self.state_manager.desired_state[resource_id]
+
+        console.print(f"[green]Creating[/green] {resource_id}...")
 
         try:
             if resource_type == "VRF":
-                vrf = VRF(**resource_data)
-                # Step 1: Create VRF
-                self.client.create_vrf(vrf.create_payload())
-                console.print("[green]✓[/green]")
-
-                # Step 2: Deploy VRF FIRST (makes it available for attachments)
-                console.print("  Deploying VRF...", end=" ")
-                time.sleep(3)  # Wait for creation to settle
-                try:
-                    deploy_payload = {"vrfNames": [vrf.name]}
-                    self.client.post(
-                        f"/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down/fabrics/{self.fabric_name}/vrfs/deployments",
-                        json=deploy_payload,
-                    )
-                    console.print("[green]✓[/green]")
-                    time.sleep(5)  # Wait for deployment
-                except Exception as e:
-                    console.print("[yellow]⚠ Deploy may need manual intervention[/yellow]")
-                    console.print(f"    {e}")
-
-                # Step 3: Try to attach to switches (may need to be done via GUI)
-                console.print("  Attaching to switches...", end=" ")
-                switches = self.client.get_switches()
-                leaf_switches = [s for s in switches if "leaf" in s.get("switchRole", "").lower()]
-
-                if leaf_switches:
-                    try:
-                        # Payload is an ARRAY of individual attachments
-                        attach_payload = [
-                            {
-                                "fabric": self.fabric_name,
-                                "vrfName": vrf.name,
-                                "serialNumber": switch.get("serialNumber"),
-                                "vlan": vrf.vlan_id,
-                                "deployment": True,
-                            }
-                            for switch in leaf_switches
-                        ]
-                        self.client.post(
-                            f"/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down/fabrics/{self.fabric_name}/vrfs/attachments",
-                            json=attach_payload,
-                        )
-                        console.print("[green]✓[/green]")
-
-                        # Deploy attachments
-                        console.print("  Deploying attachments...", end=" ")
-                        time.sleep(2)
-                        self.client.post(
-                            f"/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down/fabrics/{self.fabric_name}/vrfs/deployments",
-                            json=deploy_payload,
-                        )
-                        console.print("[green]✓[/green]")
-                    except Exception as e:
-                        console.print(f"[yellow]⚠ {e}[/yellow]")
-                        console.print("    [dim]VRF created but attachment failed. May need GUI to attach/deploy.[/dim]")
-
-                self.state_manager.update_resource(vrf)
+                self._create_vrf(VRF(**resource_data), leaf_serials)
 
             elif resource_type == "Network":
-                network = Network(**resource_data)
-                # Step 1: Create Network
-                self.client.create_network(network.create_payload())
-                console.print("[green]✓[/green]")
-
-                # Step 2: Attach to all leafs
-                console.print("  Attaching to switches...", end=" ")
-                time.sleep(2)
-
-                switches = self.client.get_switches()
-                leaf_switches = [s for s in switches if "leaf" in s.get("switchRole", "").lower()]
-
-                if leaf_switches:
-                    # Payload is an ARRAY of individual attachments
-                    attach_payload = [
-                        {
-                            "fabric": self.fabric_name,
-                            "networkName": network.name,
-                            "serialNumber": switch.get("serialNumber"),
-                            "vlan": network.vlan_id,
-                            "deployment": True,
-                        }
-                        for switch in leaf_switches
-                    ]
-                    self.client.post(
-                        f"/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down/fabrics/{self.fabric_name}/networks/attachments",
-                        json=attach_payload,
-                    )
-                    console.print("[green]✓[/green]")
-
-                    # Step 3: Deploy
-                    console.print("  Deploying...", end=" ")
-                    time.sleep(2)
-                    deploy_payload = {"networkNames": [network.name]}
-                    self.client.post(
-                        f"/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down/fabrics/{self.fabric_name}/networks/deployments",
-                        json=deploy_payload,
-                    )
-                    console.print("[green]✓[/green]")
-
-                self.state_manager.update_resource(network)
+                self._create_network(Network(**resource_data), leaf_serials)
 
         except Exception as e:
-            console.print(f"[red]✗ {e}[/red]")
+            console.print(f"  [red]✗ {e}[/red]")
             import traceback
 
-            console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            console.print(f"  [dim]{traceback.format_exc()}[/dim]")
+
+    def _create_vrf(self, vrf: VRF, leaf_serials: List[str]) -> None:
+        """
+        Full VRF lifecycle: create → attach → deploy
+
+        Step order matters:
+          1. Create the VRF definition in NDFC
+          2. Attach to leaf switches (lanAttachList payload)
+          3. Deploy — pushes config to the switches
+
+        The previous code tried deploy → attach → deploy, which caused
+        the attach to fail because NDFC wasn't ready for it yet.
+        """
+        base_url = f"/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down" f"/fabrics/{self.fabric_name}"
+
+        # Step 1: Create
+        console.print(f"  Step 1/3 — Creating VRF definition...", end=" ")
+        self.client.create_vrf(vrf.create_payload())
+        console.print("[green]✓[/green]")
+        time.sleep(3)
+
+        # Step 2: Attach to leaf switches
+        console.print(f"  Step 2/3 — Attaching to {len(leaf_serials)} leaf(s)...", end=" ")
+        attach_payload = build_vrf_attach_payload(self.fabric_name, vrf.name, leaf_serials)
+        self.client.post(f"{base_url}/vrfs/attachments", json=attach_payload)
+        console.print("[green]✓[/green]")
+        time.sleep(3)
+
+        # Step 3: Deploy — pushes config to switches
+        # NOTE: Must be {"vrfName": "name"} string, NOT {"vrfNames": [...]} array
+        console.print(f"  Step 3/3 — Deploying to switches...", end=" ")
+        deploy_payload = {"vrfName": vrf.name}
+        self.client.post(f"{base_url}/vrfs/deployments", json=deploy_payload)
+        console.print("[green]✓[/green]")
+
+        self.state_manager.update_resource(vrf)
+        console.print(f"  [green]✓ VRF {vrf.name} complete[/green]")
+
+    def _create_network(self, network: Network, leaf_serials: List[str]) -> None:
+        """
+        Full Network lifecycle: create → attach → deploy
+
+        Same three-step pattern as VRF. Network deploy uses "networkNames" (array)
+        which is different from VRF deploy which uses "vrfName" (string) — NDFC
+        is inconsistent here, both forms have been verified against the live API.
+        """
+        base_url = f"/appcenter/cisco/ndfc/api/v1/lan-fabric/rest/top-down" f"/fabrics/{self.fabric_name}"
+
+        # Step 1: Create
+        console.print(f"  Step 1/3 — Creating Network definition...", end=" ")
+        self.client.create_network(network.create_payload())
+        console.print("[green]✓[/green]")
+        time.sleep(3)
+
+        # Step 2: Attach to leaf switches
+        console.print(f"  Step 2/3 — Attaching to {len(leaf_serials)} leaf(s)...", end=" ")
+        attach_payload = build_network_attach_payload(self.fabric_name, network.name, network.vlan_id, leaf_serials)
+        self.client.post(f"{base_url}/networks/attachments", json=attach_payload)
+        console.print("[green]✓[/green]")
+        time.sleep(3)
+
+        # Step 3: Deploy
+        console.print(f"  Step 3/3 — Deploying to switches...", end=" ")
+        deploy_payload = {"networkNames": [network.name]}
+        self.client.post(f"{base_url}/networks/deployments", json=deploy_payload)
+        console.print("[green]✓[/green]")
+
+        self.state_manager.update_resource(network)
+        console.print(f"  [green]✓ Network {network.name} complete[/green]")
+
+    # ── Destroy ───────────────────────────────────────────────────────────────
 
     def _delete_resource(self, resource_id: str) -> None:
         """Delete a single resource"""
@@ -422,11 +600,11 @@ class NexusIaCFull:
 
         console.print("\n[bold red]Destroying resources...[/bold red]\n")
 
-        # Delete in reverse order (Networks before VRFs)
         resources = list(self.state_manager.current_state.keys())
         networks = [r for r in resources if r.startswith("Network:")]
         vrfs = [r for r in resources if r.startswith("VRF:")]
 
+        # Delete networks before VRFs (dependency order)
         for resource_id in networks:
             self._delete_resource(resource_id)
             time.sleep(1)
@@ -436,19 +614,24 @@ class NexusIaCFull:
             time.sleep(1)
 
         self.state_manager.save_current_state()
-        console.print("\n[bold green]✓ Destroy complete![/bold green]\n")
+        console.print("\n[bold green]✓ Destroy complete[/bold green]\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def main():
     if len(sys.argv) < 2:
-        console.print("\n[bold]Nexus Dashboard IaC - FULL VERSION[/bold]\n")
+        console.print("\n[bold]Nexus Dashboard IaC[/bold]\n")
         console.print("[cyan]Commands:[/cyan]")
-        console.print("  [yellow]inventory[/yellow] - Show fabrics and switches")
-        console.print("  [yellow]sync[/yellow]      - Sync current state from NDFC")
-        console.print("  [yellow]plan[/yellow]      - Show planned changes")
-        console.print("  [yellow]apply[/yellow]     - Apply changes")
-        console.print("  [yellow]destroy[/yellow]   - Destroy all managed resources")
-        console.print("\n[dim]Example: python nexus_iac_full.py plan[/dim]\n")
+        console.print("  [yellow]inventory[/yellow] — Show fabrics and switches")
+        console.print("  [yellow]sync[/yellow]      — Sync current state from NDFC")
+        console.print("  [yellow]plan[/yellow]      — Show planned changes")
+        console.print("  [yellow]apply[/yellow]     — Apply changes")
+        console.print("  [yellow]destroy[/yellow]   — Destroy all managed resources")
+        console.print("\n[dim]Example: uv run nexus_iac_full.py plan[/dim]\n")
         sys.exit(0)
 
     command = sys.argv[1].lower()

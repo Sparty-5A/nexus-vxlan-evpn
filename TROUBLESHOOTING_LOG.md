@@ -399,6 +399,149 @@ happen before fabric onboarding, not after, because any change requires a reload
 
 ---
 
+---
+
+### Issue 6 — Attachment Payload Wrong Structure (lanAttachList Wrapper Missing)
+
+**Phase:** 2 (IaC framework fix)
+**Component:** `infrastructure_as_code/nexus_iac_full.py` — `_create_vrf()`, `_create_network()`
+
+**Problem:**
+Both VRF and Network attachment API calls were returning 500 errors even after
+fixing the serial number issue (Issue 4). The resources were created but could
+not be attached to switches via the API.
+
+**Root Cause:**
+The attachment payload was a flat array of individual attachment dicts. NDFC
+requires a nested structure — the array must contain one object per resource,
+and each object must contain a `lanAttachList` wrapping the per-switch records.
+Several required fields were also missing from the per-switch records.
+
+**Wrong payload (flat array):**
+```python
+attach_payload = [
+    {
+        "fabric": fabric,
+        "vrfName": vrf_name,
+        "serialNumber": "99433ZAWNB5",
+        "vlan": 0,
+        "deployment": True
+    },
+    # ... next switch as another top-level item
+]
+```
+
+**Correct payload (lanAttachList wrapper):**
+```python
+attach_payload = [
+    {
+        "vrfName": vrf_name,
+        "lanAttachList": [
+            {
+                "fabric": fabric,
+                "vrfName": vrf_name,
+                "serialNumber": "99433ZAWNB5",
+                "vlan": 0,
+                "isAttached": True,      # required — was missing
+                "deployment": False,
+                "freeformConfig": "",    # required — was missing
+                "extensionValues": "",   # required — was missing
+                "instanceValues": ""     # required — was missing
+            },
+            # ... next switch inside the same lanAttachList
+        ]
+    }
+]
+```
+
+**Fix:**
+Extracted payload construction into dedicated helper functions
+`build_vrf_attach_payload()` and `build_network_attach_payload()` with
+the correct structure and all required fields.
+
+**Lesson:**
+NDFC attachment endpoints expect a resource-centric structure, not a
+switch-centric structure. One top-level entry per resource, with switches
+listed inside `lanAttachList`. When hitting unexplained 500 errors on attachment,
+the most likely cause is either the wrong payload structure or a missing required
+field — the API error messages for this are not descriptive.
+
+---
+
+### Issue 7 — Sync Parsing Wrong Fields (templateConfig is a JSON String)
+
+**Phase:** 2 (IaC framework fix)
+**Component:** `infrastructure_as_code/nexus_iac_full.py` — `sync_from_ndfc()`
+
+**Problem:**
+After fixing attachment and deployment, running `plan` after `sync` showed
+5 spurious updates — every resource appeared to need changes even though the
+fabric was correctly deployed. Diff output:
+
+```
+Network:Web_Servers:
+  vlan_id: None -> 100
+  gateway: '' -> '192.168.100.1/24'
+VRF:DEV:
+  vlan_id: 2001 -> 2002
+```
+
+**Root Cause:**
+The sync code was trying to read `vlan_id` and `gateway` as top-level fields
+in the NDFC API response. They are not top-level fields — they are stored inside
+`networkTemplateConfig` and `vrfTemplateConfig`, which are JSON strings embedded
+inside the response object. The code was reading empty/None values and storing them
+in the current state, so any real value in the desired state looked like a change.
+
+**Example NDFC response structure:**
+```json
+{
+  "networkName": "Web_Servers",
+  "networkId": 30100,
+  "vrf": "PRODUCTION",
+  "networkTemplateConfig": "{\"gatewayIpAddress\":\"192.168.100.1/24\",\"vlanId\":100,...}"
+}
+```
+
+`vlanId` and `gatewayIpAddress` are inside the JSON string — not at the top level.
+
+**Fix:**
+Parse `networkTemplateConfig` and `vrfTemplateConfig` in the sync loop:
+
+```python
+tpl_raw = net_data.get('networkTemplateConfig', '{}')
+tpl = json.loads(tpl_raw) if isinstance(tpl_raw, str) else tpl_raw
+
+network = Network(
+    vlan_id=int(tpl.get('vlanId', 0)),
+    gateway=tpl.get('gatewayIpAddress', ''),
+    ...
+)
+```
+
+Also normalised `suppressArp` from string `"true"`/`"false"` to Python bool,
+since the template config stores it as a string.
+
+**Verification:**
+After fix, `plan` returns clean:
+```
+✓ No changes needed — infrastructure is up to date
+```
+
+This confirms the tool is idempotent — running apply on an already-correct fabric
+does nothing. That is the core property a correct IaC tool must have.
+
+**Lesson:**
+NDFC stores template configuration as serialized JSON strings embedded inside
+the main response object — the same pattern used when creating resources
+(`vrfTemplateConfig` must be `json.dumps(...)` on write, and must be
+`json.loads(...)` on read). Any field that goes through the template layer
+will not be visible at the top level of the API response. When sync produces
+false positives on plan, check whether the affected fields come from template
+config rather than top-level response fields.
+
+---
+
 ## Summary Table
 
 | # | Phase | Component | Issue | Fix |
@@ -408,7 +551,11 @@ happen before fabric onboarding, not after, because any change requires a reload
 | 3 | 2 | api_client.py | VRF deploy payload wrong type | `vrfName` string not `vrfNames` array |
 | 4 | 2 | api_client.py | Attachment API needs serial numbers | Fetch serials dynamically, fix payload |
 | 5 | 3 | Switch hardware | ARP suppression blocked by TCAM=0 | Reduce racl 1536→1024, allocate arp-ether 256, reload |
+| 6 | 2 | nexus_iac_full.py | Attach payload missing lanAttachList wrapper | Restructure payload, add required fields |
+| 7 | 2 | nexus_iac_full.py | Sync reading wrong fields — templateConfig is a JSON string | Parse templateConfig on read, normalise bool types |
 
 ---
 
-*This log will be updated as additional phases are implemented.*
+*Issues 6 and 7 were discovered and fixed during IaC framework hardening after initial
+deployment was completed via GUI workaround. The tool now supports fully automated
+end-to-end VRF and Network deployment with idempotent plan/apply.*
